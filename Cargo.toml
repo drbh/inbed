@@ -1,0 +1,7 @@
+[package]
+name = "inbed"
+version = "0.1.0"
+edition = "2024"
+description = "A small, dependency-free text embedding server (Metal + CPU, OpenAI-compatible API)"
+
+[dependencies]
