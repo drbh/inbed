@@ -5,3 +5,16 @@ edition = "2024"
 description = "A small, dependency-free text embedding server (Metal + CPU, OpenAI-compatible API)"
 
 [dependencies]
+
+# `cargo bench` runs only benches/inbed.rs (it takes its own flags; see `cargo bench -- --help`)
+[lib]
+bench = false
+
+[[bin]]
+name = "inbed"
+path = "src/main.rs"
+bench = false
+
+[[bench]]
+name = "inbed"
+harness = false

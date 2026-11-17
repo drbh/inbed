@@ -1,6 +1,6 @@
 //! OpenAI-compatible embeddings API.
 
-use crate::engine::{Engine, SubmitError};
+use crate::engine::{Engine, Kind, SubmitError};
 use crate::http::{Request, Response};
 use crate::json::{self, Json};
 use crate::model::truncate_dims;
@@ -50,6 +50,27 @@ pub fn base64(b: &[u8]) -> String {
         });
     }
     s
+}
+
+/// True when the client prefers `application/octet-stream` over JSON, e.g.
+/// `Accept: application/octet-stream, application/json;q=0.5`.
+pub fn wants_binary(accept: Option<&str>) -> bool {
+    let Some(a) = accept else { return false };
+    let (mut bin, mut json) = (0.0f32, 0.0f32);
+    for part in a.split(',') {
+        let mut it = part.split(';');
+        let ty = it.next().unwrap_or("").trim().to_ascii_lowercase();
+        let q = it
+            .filter_map(|p| p.trim().strip_prefix("q="))
+            .find_map(|v| v.trim().parse::<f32>().ok())
+            .unwrap_or(1.0);
+        match ty.as_str() {
+            "application/octet-stream" => bin = bin.max(q),
+            "application/json" | "application/*" | "*/*" => json = json.max(q),
+            _ => {}
+        }
+    }
+    bin > 0.0 && bin >= json
 }
 
 impl Api {
@@ -123,16 +144,48 @@ impl Api {
         use std::sync::atomic::Ordering::Relaxed;
         let mut s = String::new();
         for e in &self.engines {
-            let st = &e.stats;
+            let st = e.stats();
+            let m = &e.spec.id;
             let _ = writeln!(
                 s,
-                "inbed_requests{{model=\"{0}\"}} {1}\ninbed_sequences{{model=\"{0}\"}} {2}\ninbed_tokens{{model=\"{0}\"}} {3}\ninbed_batches{{model=\"{0}\"}} {4}\ninbed_busy_seconds{{model=\"{0}\"}} {5:.3}",
-                e.spec.id,
-                st.requests.load(Relaxed),
-                st.sequences.load(Relaxed),
-                st.tokens.load(Relaxed),
-                st.batches.load(Relaxed),
+                "inbed_requests{{model=\"{m}\"}} {}",
+                st.requests.load(Relaxed)
+            );
+            let _ = writeln!(
+                s,
+                "inbed_rejected{{model=\"{m}\"}} {}",
+                st.rejected.load(Relaxed)
+            );
+            let _ = writeln!(
+                s,
+                "inbed_sequences{{model=\"{m}\"}} {}",
+                st.sequences.load(Relaxed)
+            );
+            let _ = writeln!(
+                s,
+                "inbed_tokens{{model=\"{m}\"}} {}",
+                st.tokens.load(Relaxed)
+            );
+            let _ = writeln!(
+                s,
+                "inbed_batches{{model=\"{m}\"}} {}",
+                st.batches.load(Relaxed)
+            );
+            let _ = writeln!(
+                s,
+                "inbed_busy_seconds{{model=\"{m}\"}} {:.3}",
                 st.busy_us.load(Relaxed) as f64 / 1e6
+            );
+            let _ = writeln!(
+                s,
+                "inbed_queued_tokens{{model=\"{m}\",kind=\"query\"}} {}\ninbed_queued_tokens{{model=\"{m}\",kind=\"document\"}} {}",
+                e.queued_tokens(Kind::Query),
+                e.queued_tokens(Kind::Document)
+            );
+            let _ = writeln!(
+                s,
+                "inbed_tokens_per_second{{model=\"{m}\"}} {:.0}",
+                e.throughput()
             );
         }
         Response::text(200, &s)
@@ -280,56 +333,79 @@ impl Api {
         };
         let tokens: usize = seqs.iter().map(Vec::len).sum();
 
-        let rx = match eng.submit(seqs) {
-            Ok(rx) => rx,
-            Err(SubmitError::Busy) => {
+        let kind = if query { Kind::Query } else { Kind::Document };
+        let ticket = match eng.submit(seqs, kind) {
+            Ok(t) => t,
+            Err(SubmitError::Busy { retry_after_ms }) => {
                 return error(
                     429,
                     "rate_limited",
-                    "the embedding queue is full; retry later",
-                );
+                    "the embedding queue is over its wait limit; retry later",
+                )
+                .header("Retry-After", retry_after_ms.div_ceil(1000).max(1));
             }
             Err(SubmitError::NotReady(m)) => return error(503, "not_ready", &m),
             Err(SubmitError::Failed(m)) => return error(503, "not_ready", &m),
         };
-        let vecs = match rx.recv() {
-            Ok(Ok(v)) => v,
-            Ok(Err(e)) => return error(500, "internal_error", &e),
-            Err(_) => return error(503, "not_ready", "model worker stopped"),
+        let out = match ticket.wait() {
+            Ok(v) => v,
+            Err(e) => return error(500, "internal_error", &e),
         };
+        let n = out.vecs.len();
+        let vecs = out.vecs.into_iter().map(|v| truncate_dims(v, dims));
 
-        let mut s = String::with_capacity(64 + vecs.len() * dims * if b64 { 6 } else { 12 });
-        s.push_str("{\"object\":\"list\",\"model\":");
-        json::write_str(&mut s, &spec.id);
-        s.push_str(",\"data\":[");
-        for (i, v) in vecs.into_iter().enumerate() {
-            let v = truncate_dims(v, dims);
-            if i > 0 {
-                s.push(',');
-            }
-            let _ = write!(s, "{{\"object\":\"embedding\",\"index\":{i},\"embedding\":");
-            if b64 {
-                let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
-                s.push('"');
-                s.push_str(&base64(&bytes));
-                s.push('"');
-            } else {
-                s.push('[');
-                for (k, x) in v.iter().enumerate() {
-                    if k > 0 {
-                        s.push(',');
-                    }
-                    json::write_f32(&mut s, *x);
+        let resp = if wants_binary(req.header("accept")) {
+            let mut body = Vec::with_capacity(n * dims * 4);
+            for v in vecs {
+                for x in v {
+                    body.extend_from_slice(&x.to_le_bytes());
                 }
-                s.push(']');
             }
-            s.push('}');
-        }
-        let _ = write!(
-            s,
-            "],\"usage\":{{\"prompt_tokens\":{tokens},\"total_tokens\":{tokens}}}}}"
-        );
-        Response::json(200, s)
+            Response {
+                status: 200,
+                content_type: "application/octet-stream",
+                headers: Vec::new(),
+                body,
+            }
+            .header("X-Embedding-Count", n)
+            .header("X-Embedding-Dims", dims)
+            .header("X-Embedding-Dtype", "f32")
+            .header("X-Usage-Prompt-Tokens", tokens)
+        } else {
+            let mut s = String::with_capacity(64 + n * dims * if b64 { 6 } else { 12 });
+            s.push_str("{\"object\":\"list\",\"model\":");
+            json::write_str(&mut s, &spec.id);
+            s.push_str(",\"data\":[");
+            for (i, v) in vecs.enumerate() {
+                if i > 0 {
+                    s.push(',');
+                }
+                let _ = write!(s, "{{\"object\":\"embedding\",\"index\":{i},\"embedding\":");
+                if b64 {
+                    let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+                    s.push('"');
+                    s.push_str(&base64(&bytes));
+                    s.push('"');
+                } else {
+                    s.push('[');
+                    for (k, x) in v.iter().enumerate() {
+                        if k > 0 {
+                            s.push(',');
+                        }
+                        json::write_f32(&mut s, *x);
+                    }
+                    s.push(']');
+                }
+                s.push('}');
+            }
+            let _ = write!(
+                s,
+                "],\"usage\":{{\"prompt_tokens\":{tokens},\"total_tokens\":{tokens}}}}}"
+            );
+            Response::json(200, s)
+        };
+        resp.header("X-Inbed-Queue-Us", out.queue_us)
+            .header("X-Inbed-Compute-Us", out.compute_us)
     }
 }
 
@@ -348,6 +424,18 @@ fn token_ids(a: &[Json], spec: &crate::model::Spec) -> Option<Vec<u32>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn accept_negotiation() {
+        use super::wants_binary as w;
+        assert!(w(Some("application/octet-stream, application/json;q=0.5")));
+        assert!(w(Some("application/octet-stream")));
+        assert!(!w(Some("application/json")));
+        assert!(!w(Some("application/json, application/octet-stream;q=0.5")));
+        assert!(!w(Some("application/octet-stream;q=0")));
+        assert!(!w(Some("*/*")));
+        assert!(!w(None));
+    }
+
     #[test]
     fn b64() {
         assert_eq!(super::base64(b"hello"), "aGVsbG8=");

@@ -31,4 +31,5 @@ curl -s 127.0.0.1:8070/v1/embeddings -d '{
 
 ```bash
 cargo test --release
+cargo bench
 ```

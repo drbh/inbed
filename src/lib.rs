@@ -4,11 +4,14 @@
 #![allow(clippy::macro_metavars_in_unsafe)]
 
 pub mod backend;
+pub mod bench;
 pub mod cpu;
 pub mod hub;
 pub mod json;
 pub mod model;
+pub mod ring;
 pub mod safetensors;
+pub mod sys;
 pub mod tokenizer;
 pub mod unicode;
 #[rustfmt::skip]

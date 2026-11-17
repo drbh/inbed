@@ -1,19 +1,24 @@
 use inbed::api::Api;
-use inbed::backend::{Backend, Batch};
 use inbed::engine::{Device, Engine, EngineConfig};
 use inbed::model::{self, Spec};
 use std::sync::Arc;
-use std::time::Instant;
 
 const USAGE: &str = "\
 inbed: a small, dependency-free text embedding server (OpenAI-compatible /v1/embeddings)
 
 USAGE:
-  inbed serve    --model <M> [--model <M>...] [--addr 127.0.0.1:8070] [--device auto|metal|cpu]
-                 [--threads 32] [--max-batch-tokens 16384] [--queue 64] [--max-inputs 2048]
+  inbed serve    --model <M> [--model <M>...] [--addr 127.0.0.1:8070] [--unix PATH [--unix-mode 660]]
+                 [--device auto|metal|cpu] [--threads 32] [--idle-timeout-s 600]
+                 [--max-batch-tokens 16384] [--queue 64] [--max-inputs 2048]
+                 [--query-max-wait-ms 100] [--doc-max-wait-ms 5000] [--doc-slice-ms 20] [--spin-us 50]
   inbed embed    --model <M> [--device D] [--query] [--dims N] <text>...
   inbed tokenize --model <M> [--query] <text>...
-  inbed bench    --model <M> [--device D] [--batches 1,8,32,128] [--seq-len 128] [--iters 10]
+  inbed bench    --model <M> [--mode model|idle|load|http] [--device D] [--rounds 3] [--iters 30]
+                 model: [--batches 1,8,32,128] [--seq-len 128] [--long]
+                 idle:  [--gaps 0,1,5,10,20,50,100]
+                 load:  [--seconds 4] [--doc-clients 4] [--doc-batch 32] [--query-every-ms 10]
+                 (engine flags as for serve apply to idle, load and http)
+  Reproducible suite with saved JSON and baselines: cargo bench -- --help
   inbed models
 
 <M> is a registry name (qwen/qwen3-embedding-0p6b), a Hugging Face repo id in the local cache,
@@ -29,7 +34,7 @@ struct Args {
 
 impl Args {
     fn parse(v: &[String]) -> Result<Args, String> {
-        const BOOLS: &[&str] = &["query", "help"];
+        const BOOLS: &[&str] = &["query", "help", "long"];
         let mut a = Args {
             flags: vec![],
             bools: vec![],
@@ -160,11 +165,7 @@ fn serve(a: &Args) -> Result<(), String> {
     if models.is_empty() {
         return Err("serve: at least one --model is required".into());
     }
-    let cfg = EngineConfig {
-        device: device(a)?,
-        max_batch_tokens: a.num("max-batch-tokens", 16384)?,
-        queue: a.num("queue", 64)?,
-    };
+    let cfg = engine_cfg(a)?;
     let mut engines = Vec::new();
     for m in &models {
         let spec = spec_for(m)?;
@@ -181,21 +182,42 @@ fn serve(a: &Args) -> Result<(), String> {
         );
         engines.push(Engine::start(spec, cfg)?);
     }
-    let addr = a.get("addr").unwrap_or_else(|| "127.0.0.1:8070".into());
-    let listener = std::net::TcpListener::bind(&addr).map_err(|e| format!("bind {addr}: {e}"))?;
-    eprintln!(
-        "inbed: listening on http://{addr} (device {:?})",
-        cfg.device
-    );
     let api = Arc::new(Api {
         engines,
         max_inputs: a.num("max-inputs", 2048)?,
     });
-    inbed::http::serve(
-        listener,
-        a.num("threads", 32)?,
-        Arc::new(move |r| api.handle(r)),
-    );
+    let handler: inbed::http::Handler = Arc::new(move |r| api.handle(r));
+    let idle = a.num("idle-timeout-s", 600)?;
+    let hcfg = inbed::http::Config {
+        threads: a.num("threads", 32)?,
+        idle_timeout: (idle > 0).then(|| std::time::Duration::from_secs(idle as u64)),
+    };
+    // one connection limit across both listeners
+    let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let unix = a.get("unix");
+    // TCP unless only --unix was given
+    if a.get("addr").is_some() || unix.is_none() {
+        let addr = a.get("addr").unwrap_or_else(|| "127.0.0.1:8070".into());
+        let l = std::net::TcpListener::bind(&addr).map_err(|e| format!("bind {addr}: {e}"))?;
+        eprintln!(
+            "inbed: listening on http://{addr} (device {:?})",
+            cfg.device
+        );
+        inbed::http::spawn(l, hcfg, active.clone(), handler.clone());
+    }
+    if let Some(path) = unix {
+        let mode = u32::from_str_radix(&a.get("unix-mode").unwrap_or_else(|| "660".into()), 8)
+            .map_err(|_| "--unix-mode: not an octal mode".to_string())?;
+        let l = inbed::http::bind_unix(&path, mode)?;
+        eprintln!(
+            "inbed: listening on unix://{path} (device {:?})",
+            cfg.device
+        );
+        inbed::http::spawn(l, hcfg, active, handler);
+    }
+    loop {
+        std::thread::park();
+    }
 }
 
 fn embed(a: &Args) -> Result<(), String> {
@@ -257,104 +279,74 @@ fn models() -> Result<(), String> {
     Ok(())
 }
 
-fn bench(a: &Args) -> Result<(), String> {
-    let spec = one_model(a)?;
-    let seq_len = a.num("seq-len", 128)?.min(spec.max_tokens);
-    let iters = a.num("iters", 10)?.max(1);
-    let batches: Vec<usize> = a
-        .get("batches")
-        .unwrap_or_else(|| "1,8,32,128".into())
-        .split(',')
-        .map(|s| {
-            s.trim()
-                .parse()
-                .map_err(|_| format!("bad --batches entry {s}"))
-        })
-        .collect::<Result<_, _>>()?;
-    let tok = spec.tokenizer()?;
-    let text = "The quick brown fox jumps over the lazy dog while embeddings map text to vectors. "
-        .repeat(seq_len);
-    let doc = tok.encode(&text, seq_len);
-    let short = tok.encode(
-        &format!("{}what is a fast vector database?", spec.query_prefix),
-        spec.max_tokens,
-    );
-    match device(a)? {
-        #[cfg(target_os = "macos")]
-        Device::Metal => {
-            let mut b = inbed::metal::Metal::new()?;
-            eprintln!("device: {}", b.device_name());
-            run_bench(&spec, &mut b, &doc, &short, &batches, iters)?;
-            for (k, n, t) in b.take_profile() {
-                println!("  {k:<14} {n:>7} calls {:>10.2} ms", t * 1e3);
-            }
-            Ok(())
-        }
-        #[cfg(not(target_os = "macos"))]
-        Device::Metal => Err("Metal is only available on macOS".into()),
-        Device::Cpu => run_bench(
-            &spec,
-            &mut inbed::cpu::Cpu::new(),
-            &doc,
-            &short,
-            &batches,
-            iters,
-        ),
-    }
+fn engine_cfg(a: &Args) -> Result<EngineConfig, String> {
+    let d = EngineConfig::default();
+    Ok(EngineConfig {
+        device: device(a)?,
+        max_batch_tokens: a.num("max-batch-tokens", d.max_batch_tokens)?,
+        queue: a.num("queue", d.queue)?,
+        query_max_wait_ms: a.num("query-max-wait-ms", d.query_max_wait_ms as usize)? as u64,
+        doc_max_wait_ms: a.num("doc-max-wait-ms", d.doc_max_wait_ms as usize)? as u64,
+        doc_slice_ms: a.num("doc-slice-ms", d.doc_slice_ms as usize)? as u64,
+        spin_us: a.num("spin-us", d.spin_us as usize)? as u64,
+    })
 }
 
-fn run_bench<B: Backend>(
-    spec: &Spec,
-    b: &mut B,
-    doc: &[u32],
-    short: &[u32],
-    batches: &[usize],
-    iters: usize,
-) -> Result<(), String> {
-    let t0 = Instant::now();
-    let w = model::load_weights(spec, b)?;
-    println!(
-        "model {} on {}: loaded in {:.2}s",
-        spec.id,
-        b.name(),
-        t0.elapsed().as_secs_f64()
-    );
-    // warm-up
-    model::forward(spec, &w, b, &Batch::new(&[short]));
-    let mut lat: Vec<f64> = (0..iters.max(20))
-        .map(|_| {
-            let t = Instant::now();
-            model::forward(spec, &w, b, &Batch::new(&[short]));
-            t.elapsed().as_secs_f64() * 1e3
-        })
-        .collect();
-    lat.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    println!(
-        "query latency ({} tokens, batch 1): p50 {:.2} ms, p90 {:.2} ms",
-        short.len(),
-        lat[lat.len() / 2],
-        lat[lat.len() * 9 / 10]
-    );
-    println!(
-        "{:>6} {:>8} {:>10} {:>12}",
-        "batch", "tokens", "ms/batch", "tokens/s"
-    );
-    for &bs in batches {
-        let seqs: Vec<&[u32]> = (0..bs).map(|_| doc).collect();
-        let batch = Batch::new(&seqs);
-        model::forward(spec, &w, b, &batch);
-        let t = Instant::now();
-        for _ in 0..iters {
-            model::forward(spec, &w, b, &batch);
+fn bench(a: &Args) -> Result<(), String> {
+    use inbed::bench::{self, Load, Opts, Recorder};
+    let spec = one_model(a)?;
+    let d = Opts::default();
+    let opts = Opts {
+        rounds: a.num("rounds", 3)?.max(1),
+        iters: a.num("iters", d.iters)?.max(2),
+        seconds: a.num("seconds", 4)? as f64,
+        quick: true,
+    };
+    let list = |k: &str, def: &str| -> Result<Vec<usize>, String> {
+        a.get(k)
+            .unwrap_or_else(|| def.into())
+            .split(',')
+            .map(|s| s.trim().parse().map_err(|_| format!("bad --{k} entry {s}")))
+            .collect()
+    };
+    let mut r = Recorder::new(false);
+    let cfg = engine_cfg(a)?;
+    match a.get("mode").as_deref().unwrap_or("model") {
+        "model" => bench::model_suite_on(
+            &spec,
+            cfg.device,
+            Opts {
+                quick: !a.has("long"),
+                ..opts
+            },
+            &list("batches", "1,8,32,128")?,
+            a.num("seq-len", 128)?,
+            &mut r,
+        )?,
+        "idle" => {
+            let gaps: Vec<u64> = list("gaps", "0,1,5,10,20,50,100")?
+                .into_iter()
+                .map(|g| g as u64)
+                .collect();
+            bench::idle_suite(&spec, cfg, &gaps, opts, &mut r)?
         }
-        let ms = t.elapsed().as_secs_f64() * 1e3 / iters as f64;
-        println!(
-            "{:>6} {:>8} {:>10.2} {:>12.0}",
-            bs,
-            batch.tokens(),
-            ms,
-            batch.tokens() as f64 / ms * 1e3
-        );
+        "load" => bench::load_suite(
+            &spec,
+            cfg,
+            Load {
+                clients: a.num("doc-clients", 4)?,
+                doc_batch: a.num("doc-batch", 32)?,
+                seq_len: a.num("seq-len", 128)?,
+                query_every: std::time::Duration::from_millis(a.num("query-every-ms", 10)? as u64),
+            },
+            opts,
+            &mut r,
+        )?,
+        "http" => bench::http_suite(&spec, cfg, opts, &mut r)?,
+        m => return Err(format!("unknown --mode {m} (model, idle, load, http)")),
+    }
+    for m in &r.metrics {
+        println!("{}", bench::fmt_metric(m));
     }
     Ok(())
 }
