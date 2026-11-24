@@ -248,6 +248,17 @@ pub fn model_suite_on(
         }
         #[cfg(not(target_os = "macos"))]
         Device::Metal => Err("Metal is only available on macOS".into()),
+        #[cfg(target_os = "linux")]
+        Device::Cuda => {
+            let mut b = crate::cuda::Cuda::new()?;
+            model_suite(spec, device, &mut b, opts, batches, seq_len, r)?;
+            for (k, n, t) in b.take_profile() {
+                eprintln!("  profile {k:<14} {n:>7} calls {:>10.2} ms", t * 1e3);
+            }
+            Ok(())
+        }
+        #[cfg(not(target_os = "linux"))]
+        Device::Cuda => Err("CUDA is only available on Linux".into()),
         Device::Cpu => model_suite(
             spec,
             device,
@@ -718,7 +729,15 @@ pub fn meta(models: &[&Spec], device: Device, opts: Opts, args: &[String]) -> Js
                 .map(|m| m.device_name().to_string())
         })
         .flatten();
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    let gpu = (device == Device::Cuda)
+        .then(|| {
+            crate::cuda::Cuda::new()
+                .ok()
+                .map(|c| format!("{} ({})", c.device_name(), c.arch()))
+        })
+        .flatten();
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     let gpu: Option<String> = None;
     let env: Vec<Json> = std::env::vars()
         .filter(|(k, _)| k.starts_with("INBED_"))

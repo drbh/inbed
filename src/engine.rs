@@ -17,24 +17,37 @@ use std::time::{Duration, Instant};
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Device {
     Metal,
+    Cuda,
     Cpu,
 }
 
 impl Device {
     pub fn parse(s: &str) -> Result<Device, String> {
         match s {
-            "metal" | "gpu" => Ok(Device::Metal),
+            "metal" => Ok(Device::Metal),
+            "cuda" => Ok(Device::Cuda),
+            "gpu" => Ok(if cfg!(target_os = "macos") {
+                Device::Metal
+            } else {
+                Device::Cuda
+            }),
             "cpu" => Ok(Device::Cpu),
             "auto" => Ok(Device::auto()),
-            _ => Err(format!("unknown device {s:?} (metal, cpu, auto)")),
+            _ => Err(format!(
+                "unknown device {s:?} (metal, cuda, gpu, cpu, auto)"
+            )),
         }
     }
+    /// Metal on macOS; CUDA on Linux when a device and its libraries are there; else the CPU.
     pub fn auto() -> Device {
-        if cfg!(target_os = "macos") {
-            Device::Metal
-        } else {
-            Device::Cpu
+        #[cfg(target_os = "macos")]
+        return Device::Metal;
+        #[cfg(target_os = "linux")]
+        if crate::cuda::available() {
+            return Device::Cuda;
         }
+        #[allow(unreachable_code)]
+        Device::Cpu
     }
 }
 
@@ -197,6 +210,12 @@ impl Engine {
                     }
                     #[cfg(not(target_os = "macos"))]
                     Device::Metal => Err("Metal is only available on macOS".to_string()),
+                    #[cfg(target_os = "linux")]
+                    Device::Cuda => {
+                        crate::cuda::Cuda::new().and_then(|b| worker(b, &spec, cfg, &sh))
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    Device::Cuda => Err("CUDA is only available on Linux".to_string()),
                     Device::Cpu => worker(crate::cpu::Cpu::new(), &spec, cfg, &sh),
                 };
                 if let Err(e) = r {

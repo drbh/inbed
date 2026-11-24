@@ -17,6 +17,8 @@ pub mod unicode;
 #[rustfmt::skip]
 pub mod unicode_tables;
 pub mod api;
+#[cfg(target_os = "linux")]
+pub mod cuda;
 pub mod engine;
 pub mod http;
 #[cfg(target_os = "macos")]

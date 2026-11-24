@@ -188,3 +188,34 @@ fn qwen3_metal() {
     let mut m = inbed::metal::Metal::new().unwrap();
     check_vectors("qwen/qwen3-embedding-0p6b", "qwen3", &mut m, 0.999);
 }
+
+#[cfg(target_os = "linux")]
+fn cuda() -> Option<inbed::cuda::Cuda> {
+    match inbed::cuda::Cuda::new() {
+        Ok(c) => Some(c),
+        Err(e) if e.contains("could not load") || e.contains("no CUDA device") => {
+            eprintln!("skip: {e}");
+            None
+        }
+        Err(e) => panic!("{e}"),
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn minilm_cuda() {
+    let Some(mut c) = cuda() else { return };
+    check_vectors(
+        "sentence-transformers/all-MiniLM-L6-v2",
+        "minilm",
+        &mut c,
+        0.999,
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn qwen3_cuda() {
+    let Some(mut c) = cuda() else { return };
+    check_vectors("qwen/qwen3-embedding-0p6b", "qwen3", &mut c, 0.999);
+}

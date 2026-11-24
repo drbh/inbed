@@ -8,7 +8,7 @@ inbed: a small, dependency-free text embedding server (OpenAI-compatible /v1/emb
 
 USAGE:
   inbed serve    --model <M> [--model <M>...] [--addr 127.0.0.1:8070] [--unix PATH [--unix-mode 660]]
-                 [--device auto|metal|cpu] [--threads 32] [--idle-timeout-s 600]
+                 [--device auto|metal|cuda|cpu] [--threads 32] [--idle-timeout-s 600]
                  [--max-batch-tokens 16384] [--queue 64] [--max-inputs 2048]
                  [--query-max-wait-ms 100] [--doc-max-wait-ms 5000] [--doc-slice-ms 20] [--spin-us 50]
   inbed embed    --model <M> [--device D] [--query] [--dims N] <text>...

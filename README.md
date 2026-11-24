@@ -1,9 +1,9 @@
 # inbed
 
-a text embedding server in Rust with zero crate dependencies. runs on Metal or the CPU and speaks the OpenAI `/v1/embeddings` API.
+a text embedding server in Rust with zero crate dependencies. runs on Metal, CUDA, or the CPU and speaks the OpenAI `/v1/embeddings` API.
 
 ```
-Qwen3-Embedding-0.6B, M3 Max:  11.3 ms per query, 7.5k tok/s batched
+Qwen3-Embedding-0.6B, RTX 4090:  1.9 ms per query, 112k tok/s batched
 ```
 
 ## install

@@ -84,7 +84,7 @@ fn parse() -> Result<Args, String> {
             "--cooldown-s" => a.cooldown = Duration::from_secs_f64(num(val()?)?),
             "-h" | "--help" => {
                 println!(
-                    "cargo bench -- [--quick] [--models a,b] [--suites {}] [--device metal|cpu]\n\
+                    "cargo bench -- [--quick] [--models a,b] [--suites {}] [--device metal|cuda|cpu]\n\
                      \t[--rounds 5] [--iters 30] [--seconds 4] [--cooldown-s 2]\n\
                      \t[--save-baseline NAME] [--baseline NAME] [--threshold 5 (%)] [--fail-on-regression]\n\
                      \t[--out target/inbed-bench]",
