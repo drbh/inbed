@@ -9,6 +9,7 @@ Qwen3-Embedding-0.6B, RTX 4090:  1.9 ms per query, 112k tok/s batched
 ## install
 
 ```bash
+nix run github:drbh/inbed -- serve --model qwen/qwen3-embedding-0p6b    # or .#cuda on linux
 cargo install --git https://github.com/drbh/inbed.git
 ```
 
